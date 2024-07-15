@@ -1,0 +1,1147 @@
+import re
+import os
+import csv
+import binascii
+import uuid
+import datetime
+import operator
+import platform
+import pytz
+from xlrd import open_workbook, XL_CELL_NUMBER, XL_CELL_BOOLEAN
+import random
+
+from logs import Logger, logged
+from collections import OrderedDict
+from dateutil.parser import parse
+
+log = Logger().get_logger()
+
+
+def get_field(field, separator, n, not_found=''):
+    """ Get the nth field in field separated by separator.
+
+        If n is outside the range of values return a blank string.
+    """
+
+    try:
+        result = field.split(separator)[n]
+    except IndexError:
+        result = not_found
+    return result
+
+
+def get_field_using_re(string, pattern):
+    """ search for the pattern in the given string and return the string which matches
+
+    Example : String - myWorkflow.setTargetProcessState("$param")
+    Pattern - ^\w*.set(\w*)\(
+    Result - TargetProcessState
+    """
+
+    re_pattern = re.compile(pattern)
+    match = re_pattern.search(string)
+    if match is not None:
+        return match.group(1)
+    else:
+        return string
+
+
+def count_fields(field, separator):
+    """ Return the number of items in the string field separated by separator. """
+
+    return len(field.split(separator))
+
+
+def nvp_get_value(string, name, field_separator, value_separator):
+    """ Return a value from a string containing name value pairs.
+
+        Example:
+
+        string = 'field1=value1;field2=value2;field3=value3'
+
+        nvp_get_value(string, 'field2', ';', '=') would reutrn value2
+    """
+
+    for field in string.split(field_separator):
+        if get_field(field, value_separator, 0) == name:
+            return get_field(field, value_separator, 1)
+    return None
+
+
+def load_csv_as_dictionary(filename, separator=',', skip_lines=1):
+    """ Load a csv file as a dictionary.
+
+        Where the first column is the key and the second column the value.
+
+    """
+    result = {}
+    if len(separator) > 1:
+        contents = read_file_into_list(filename)
+        for line in contents[skip_lines:]:
+            key, value = line.split(separator)
+            result[key] = value
+    else:
+        with open(filename, 'r') as f:
+            reader = csv.reader(f, delimiter=separator)
+
+            for i in range(0, skip_lines):
+                next(reader, None)
+
+            for value in reader:
+                if len(value) == 2:
+                    result[value[0]] = value[1]
+
+    return result
+
+
+def load_csv_as_list_of_dictionary(filename, separator=',', skip_lines=1, dictionary_order=False):
+    """Load a csv file as a list of dictionaries.
+       Where first row are the keys and rest of the rows are values
+    """
+    result = []
+    with open(filename) as f:
+        file_contents = [line.rstrip('\n').strip('\r') for line in f.readlines()]
+
+    keys = file_contents[0].split(separator)
+    for item in file_contents[skip_lines:]:
+        if not item:
+            continue
+        items = item.split(separator)
+        if dictionary_order:
+            d = OrderedDict()
+        else:
+            d = {}
+        for key in keys:
+            d[key] = items[keys.index(key)]
+        result.append(d)
+
+    return result
+
+
+def convert_list_of_list_to_list_of_dictionary(list_):
+    """
+    Convert a list to a dictionary.
+    Where the first item in the list is the key and subsequent items are the values.
+    E.g. list_ = [['A', 'B'], ['1', '2'], ['3', '4']]
+        results in [{'A': '1', 'B': '2'}, {'A': '3', 'B': '4'}]
+    """
+    result = []
+    keys = list_[0]
+    for item in list_[1:]:
+        result.append(dict(zip(keys, item)))
+    return result
+
+
+def load_csv_as_Json_style_dictionary(filename, separator=','):
+    """Load a csv file as a key value pairs where the results looks like JSON dictionary
+    First row are the headers and rest of the rows are values
+    example :
+    ==================================
+    Fields|	new|trade |	cancel|trade
+    ======|============================
+    a     |  new      |   cancel
+    b     |  fx       |   fxo
+    c     |  333      |   444
+
+    Result :
+    {
+      "a": {
+        "new|trade": "new",
+        "cancel|trade": "cancel"
+      },
+      "b": {
+        "new|trade": "fx",
+        "cancel|trade": "fxo"
+      },
+      "c": {
+        "new|trade": "3333",
+        "cancel|trade": "444"
+      }
+    }
+    """
+
+    with open(filename) as f:  # remove all \n
+        file_contents = [line.rstrip('\n').strip('\r') for line in f.readlines()]
+
+    keys = file_contents[0].split(separator)[1:]  # skip the first value in header
+    e = {}
+    for item in file_contents[1:]:
+        items = item.split(separator)
+        main_key = items[0]
+        values = items[1:]
+        d = {}
+        for key in keys:
+            d[key] = values[keys.index(key)]
+        e[main_key] = d
+    return e
+
+
+def merge_string(first, second, separator):
+    """ Concatenate the strings with separator. """
+
+    if first == '':
+        return second
+    else:
+        return first + separator + second
+
+
+def rename_dictionary_key(dictionary, old_key, new_key):
+    """ Rename old_key in dictionary as new_key. """
+
+    if old_key in dictionary:
+        dictionary[new_key] = dictionary.pop(old_key)
+    return dictionary
+
+
+def remove_keys_from_dictionary(dictionary, keys):
+    """ Remove keys from dictionary. """
+
+    for key in keys:
+        if key in dictionary:
+            del dictionary[key]
+
+
+def is_dvh(dvh):
+    """ Perform a regex check that dvh is of valid format.  If not, raises an exception. """
+
+    if not re.match('^[0-9A-F]{64}$', dvh):
+        raise Exception('Format of DVH is incorrect - it should be 64 hexadecimal characters - ' + dvh)
+
+
+def escape_regex_characters(value):
+    """ Replace regex special characters in value with escaped version of the characters. """
+
+    replacements = {'[': r'\[',
+                    ']': r'\]',
+                    '^': r'\^',
+                    '-': r'\-',
+                    '|': r'\|',
+                    '(': r'\(',
+                    ')': r'\)'}
+
+    for r in replacements:
+        value = value.replace(r, replacements[r])
+
+    return value
+
+
+@logged()
+def path_join(*args):
+    """ Calls os.path.join with logging. """
+
+    return os.path.join(*args)
+
+
+@logged()
+def make_path(path):
+    if not os.path.exists(path):
+        os.mkdir(path)
+
+
+def get_temp_directory():
+    """ Return the value of the TEMP environment variable. """
+
+    if platform.system() == 'Windows':
+        return os.getenv('TEMP')
+    else:
+        return '/tmp'
+
+
+def get_temp_file(extension='.tmp'):
+    """ Return a randomised name of a temporary file.
+
+        It does not create the file - that is up to the calling function.
+    """
+
+    return os.path.join(get_temp_directory(), (binascii.b2a_hex(os.urandom(6)).upper() + extension))
+
+
+def remove_bad_characters_from_filename(filename):
+    """
+    Replaces known bad characters with empty string in the supplied filename
+    """
+    bad_chars = ['*', '"', '/', '\\', '[', ']', ':', ';', '|', '=', ',']
+    for bad_char in bad_chars:
+        filename = filename.replace(bad_char, '')
+    return filename
+
+
+def is_float(s):
+    """ Checks if s is a float by attempting to convert it to float.
+
+        If the conversion works the function returns True.
+
+        If the conversion results in a ValueError the exception is caught and the function returns False.
+    """
+    try:
+        float(s)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def convert_check_value(value):
+    """ Converts a value so it can be checked. """
+
+    # Has to check that it's not True or False as otherwise True gets converted to 1 and False to 0
+    if value not in [True, False] and is_float(value):
+        return '{0:.6f}'.format(float(value))
+    if isinstance(value, str):
+        if value.lower() == 'true':
+            return True
+        elif value.lower() == 'false':
+            return False
+    return value
+
+
+def check_value(description, expected, actual):
+    """ Check that expected equals actual.
+
+        Floating point numbers are rounded to 6 decimal places and converted to strings to compare.
+
+        Boolean string values are converted to booleans to be compared.
+
+        An exception is raised if they do not match.
+    """
+    expected = convert_check_value(expected)
+
+    actual = convert_check_value(actual)
+
+    message = '{description} Expected: {expected} Actual: {actual}'.format(description=description,
+                                                                           expected=expected,
+                                                                           actual=actual)
+    assertEqual(expected, actual, message)
+
+
+def read_file_contents(filename):
+    """ read the contents of the file and return as a string. """
+
+    with open(filename, 'r') as f:
+        return f.read()
+
+
+def read_file_into_list(filename):
+    """ read the contents of the file and return as a list of strings. Strips newline character from end. """
+
+    with open(filename, 'r') as f:
+        return [line.rstrip('\n') for line in f.readlines()]
+
+
+def write_file(filename, text):
+    """ write the text to the supplied filename. """
+
+    with open(filename, 'wt') as f:
+        return f.write(text)
+
+
+def get_file_name_without_extension(file_path):
+    """ Get the file name without extension"""
+
+    return os.path.splitext(get_file_name_from_file_path(file_path))[0]
+
+
+def get_file_extension(file_path):
+    """ Get the file extension """
+
+    filename, file_extension = os.path.splitext(file_path)
+    return file_extension
+
+
+def get_file_name_from_file_path(file_path):
+    """Get the file name only from the given file path"""
+
+    return os.path.basename(file_path)
+
+
+@logged()
+def get_checklist(check_file=None):
+    """ Return a list of checks read from checkFile. """
+
+    checks = []
+    if check_file is not None:
+        checks = read_file_into_list(check_file)
+        log.info('{}'.format(checks))
+    return checks
+
+
+def convert_zone_time_into_utc_time(date_time):
+    """ convert into utc time. provide date and time as datetime type
+    e.g 2016-07-08 00:00:00+10:05'
+    Result - '2016-07-07 13:55:00'"""
+
+    zone = pytz.timezone('UTC')
+    in_utc_time = date_time.astimezone(zone).strftime("%Y-%m-%d %H:%M:%S")
+    return in_utc_time
+
+
+def convert_into_zone_time(date_time, zone):
+    """ convert into zone time. provide date and time as string in 2016-07-08 00:00:00  format
+    e.g 2016-07-08 00:00:00 , 'Australia/Sydney'
+    Result - 2016-07-08 00:00:00+10:05"""
+
+    zone_off_set = pytz.timezone(zone)
+    zone_time = datetime.datetime.strptime(date_time, '%Y-%m-%d %H:%M:%S').replace(tzinfo=zone_off_set)
+    return zone_time
+
+
+def convert_into_datetime_type(date_time, _format=None):
+    """convert string type time into datetime type"""
+    if not _format:
+        _format = '%Y-%m-%d %H:%M:%S'
+    return datetime.datetime.strptime(date_time, _format)
+
+
+def get_utc_time_now():
+    return datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+
+
+def time_string_to_datetime(time_str, _format='%Y-%m-%d %H:%M:%S'):
+    log.info(time_str)
+    return datetime.datetime.strptime(time_str, _format)
+
+
+class AutoAssertionError(AssertionError):
+    """ User defined assertion exception. """
+
+    def __init__(self, a, b=None, msg=''):
+        bInfo = ' and {0}'.format(b) if (b is not None) else ''
+        super(AutoAssertionError, self).__init__("Assertion failed: {0}{1} - {2}".format(a, bInfo, msg))
+
+
+def assertEqual(a, b, msg='Are not equal'):
+    """ Raise an assertion exception if a and b are not equal. """
+
+    if not (a == b):
+        raise AutoAssertionError(a, b, msg)
+    return True
+
+
+def assert_response_okay(response, msg='Status Code of Response Was not as Expected'):
+    """ Raise an assertion exception if Status code of response is not 2xx """
+    import requests
+
+    if response.status_code != requests.codes.all_good:
+        raise AutoAssertionError(response.status_code, requests.codes.all_good,
+                                 msg="{} - {}".format(msg, response.content))
+
+    return True
+
+
+def assertNotEqual(a, b, msg='Are equal'):
+    """ Raise an assertion exception if a and b are equal. """
+
+    if a == b:
+        raise AutoAssertionError(a, b, msg)
+    return True
+
+
+def assertLess(a, b, msg='Not less than'):
+    """Raise an assertion exception if a is not less than b"""
+
+    if not (a < b):
+        raise AutoAssertionError(a, b, msg)
+    return True
+
+
+def assertNotEmpty(a, msg='is empty'):
+    """ Raise an assertion if a is empty """
+    if a is None:
+        raise AutoAssertionError(a, msg=msg)
+    if not a:
+        raise AutoAssertionError(a, msg=msg)
+    return True
+
+
+def assertKeyExists(dict_, key, msg='not exists in dict'):
+    """ Raise an assertion exception if key does not exist in dict. """
+
+    if key not in dict_:
+        raise AutoAssertionError(dict_.keys(), key, msg)
+    return True
+
+
+def assertAllKeysExist(dict_, keys, msg='Key does not exist in dict'):
+    """ Raise an assertion exception if all keys do not exist in dict. """
+    assertAllInList(dict_.keys(), keys, msg=msg)
+
+
+def assertInList(item, list_, msg='item not found in list'):
+    """ Raise an assertion exception if item does not exist in list. """
+    if item not in list_:
+        raise AutoAssertionError(list_, item, msg)
+    return True
+
+
+def assertAllInList(items, list_, msg='These items were missing from the first list', raise_on_failure=True):
+    """ Check each item in items are available in list_ """
+    not_in_list = []
+
+    for item in items:
+        if item not in list_:
+            not_in_list.append(item)
+
+    if not_in_list and raise_on_failure:
+        raise AutoAssertionError(list_, items, '{msg}. {not_in_list}'.format(msg=msg, not_in_list=not_in_list))
+    if not_in_list and not raise_on_failure:
+        return not_in_list
+
+
+def assertEqualLists(list1, list2, msg='Lists are not equal to each other', raise_on_failure=True):
+    """ Check each item in items are available in list_ """
+    not_in_list = []
+
+    if len(list1) != len(list2):
+        raise AutoAssertionError(list1, list2, '{msg}'.format(msg=msg))
+
+    for item in list1:
+        if item not in list2:
+            not_in_list.append(item)
+
+    if not_in_list and raise_on_failure:
+        raise AutoAssertionError(list1, list2, '{msg}. {not_in_list}'.format(msg=msg, not_in_list=not_in_list))
+    if not_in_list and not raise_on_failure:
+        return not_in_list
+
+
+def assertNoneinList(items, list_, msg='These items are available in the first list'):
+    """ Check each item in items are not available in list_ """
+    in_list = []
+
+    for item in items:
+        if item in list_:
+            in_list.append(item)
+
+    if in_list:
+        raise AutoAssertionError(list_, items, '{msg}. {in_list}'.format(msg=msg, in_list=in_list))
+
+
+def assertIsNotNone(a, msg='Is None'):
+    """ Raise an assertion exception if a is None. """
+
+    if a is None:
+        raise AutoAssertionError(a, None, msg)
+    return True
+
+
+def assertTrue(a, msg='Is not True'):
+    """ Raise an assertion exception if a is not True. """
+
+    return assertEqual(a, True, msg)
+
+
+def assertFileExists(filename):
+    """ Raise an assertion exception if filename does not exist. """
+
+    log.debug('Asserting file exists: {}'.format(filename))
+    return assertEqual(os.path.isfile(filename), True)
+
+
+def assertDirExists(directory):
+    """ Raise an assertion exception if directory does not exist. """
+
+    return assertEqual(os.path.exists(directory), True)
+
+
+def assertAttributeExists(instance_, attribute_, msg='attribute not found in instance'):
+    """ Raise an assertion exception if instance does not have attribute. """
+
+    if not hasattr(instance_, attribute_):
+        raise AutoAssertionError(instance_, attribute_, msg)
+    return True
+
+
+def assertRegexMatches(a, pattern, msg='Regular expression does not match'):
+    if not re.match(pattern, a):
+        raise AutoAssertionError(a, pattern, msg)
+    return True
+
+
+def assertNot(l, msg='Value failed not check'):
+    if not l:
+        raise AutoAssertionError(l, [], msg=msg)
+    return True
+
+
+def compare_values(actual, expected, compare_func=assertEqual):
+    """ Compare 2 values and returns tuple message in form (Passed, Message). """
+
+    result = [None,
+              'Performing comparison of [{act_type}]{actual} to [{exp_type}]{expected}'.format(act_type=type(actual),
+                                                                                               actual=actual,
+                                                                                               exp_type=type(expected),
+                                                                                               expected=expected)]
+    try:
+        compare_func(actual.lower(), expected.lower())
+        result[0] = True
+    except AutoAssertionError:
+        result[0] = False
+    return result
+
+
+@logged()
+def name_value_pair_to_dictionary(value, item_separator, value_separator):
+    """ Converts a name value pair string to a dictionary.
+
+        e.g.
+        name1=value1;name2=value2
+
+        is converted to
+        {
+          'name1': 'value1,
+          'name2': 'value2
+        }
+
+    """
+    return dict(item.split(value_separator) for item in value.split(item_separator))
+
+
+@logged()
+def dictionary_to_name_value_pair(dict_, item_separator, value_separator):
+    """
+    Converts a dictionary to a name value pair string. Reverse of name_value_pair_to_dictionary()
+    """
+    nvp = ''
+    for key_, value_ in dict_.iteritems():
+        nvp = merge_string(nvp, '{k}{s}{v}'.format(k=key_, s=value_separator, v=value_), item_separator)
+    return nvp
+
+
+def convert_str_to_bool(value):
+    """
+    Convert string value representation to boolean representation
+    """
+    return True if value.lower() == 'true' else False
+
+
+def get_guid():
+    """
+    Returns a GUID
+    """
+    return str(uuid.uuid4())
+
+
+def get_todays_datetime():
+    """
+    Returns todays date in specified format
+    """
+    return datetime.datetime.today()
+
+
+def format_datetime(date_, format_='%Y-%m-%d'):
+    """
+    Returns a formatted datetime object
+    """
+    return date_.strftime(format=format_)
+
+
+def modify_date(date_, days=0):
+    """
+    Modifies the supplied datetime object by the specified number of days
+    """
+    return date_ + datetime.timedelta(days=days)
+
+
+def is_date_time_format(value):
+    """Returns True if the string value passed is a valid date time format, else False"""
+    try:
+        parse(value)
+        return True
+    except ValueError:
+        return False
+
+
+@logged()
+def creation_timestamp():
+    """
+    Formats the date as per required creationTimestamp format
+    """
+
+    time_ = datetime.datetime.today() - datetime.timedelta(hours=4)
+    time_ = time_.strftime(format='%Y-%m-%dT%H:%M:%S.%f')[:23]
+    return time_ + '-04:00'
+
+
+def find_in_list_of_dictionaries(list_, **kwargs):
+    """ Find the matching dictionary for the given items in kwargs in list_. """
+
+    log.info('Search for {k} in list of dictionaries:'.format(k=kwargs))
+
+    for i in range(0, len(list_)):
+        log.info('({i}): {r}'.format(i=i, r=list_[i]))
+
+        if all_items_in_dictionary(list_[i], **kwargs):
+            log.info('Search criteria {k} found at [{i}]. '.format(k=kwargs, i=i))
+            return list_[i]
+
+    log.info('Search criteria not found in list of dictionaries.')
+    return None
+
+
+def all_items_in_dictionary(dictionary, **kwargs):
+    """ Loop all key value pairs and check it matches with the given dictionary. """
+
+    for key, value in kwargs.iteritems():
+        if key not in dictionary:
+            return False
+        if dictionary[key] != value:
+            return False
+    return True
+
+
+@logged()
+def populate_csv_file(lines):
+    """
+    construct a csv file from csv-formatted text input
+    """
+    actual_filename = get_temp_file(extension='.csv')
+    with open(actual_filename, 'wb') as output_file:
+        output_file.write('\n'.join(lines))
+
+    return actual_filename
+
+
+@logged()
+def populate_csv_from_list_of_dicts(data, skip_header=False, file_path=None):
+    """
+    Creates a csv file from a dictionary that would serve as an expected result
+    skip_header: write csv without the header row
+    """
+    keys = data[0].keys()
+    if file_path:
+        out_filename = file_path
+    else:
+        out_filename = get_temp_file(extension='.csv')
+
+    with open(out_filename, 'wb') as output_file:
+        dict_writer = csv.DictWriter(output_file, keys)
+        if not skip_header:
+            dict_writer.writeheader()
+        dict_writer.writerows(data)
+
+    return out_filename
+
+
+@logged()
+def merge_csv_files_into_single_csv(list_of_csvs):
+    """ merge csv files into a single csv
+    example - list_of_csvs = [ [t1.csv,t2.csv,t3.csv,t4.csv], [t1.csv,t2.csv,t3.csv,t4.csv] ]
+     """
+    rows = []
+    for i in list_of_csvs:
+        for f in i:
+            rows.append(load_csv_as_list_of_dictionary(f, dictionary_order=True)[0])
+
+    merged_file = populate_csv_from_list_of_dicts(rows)
+
+    return merged_file
+
+
+@logged()
+class DictCompare(object):
+    """
+    Calculate the difference between two dictionaries
+    """
+
+    def __init__(self, first_dict, second_dict, raise_on_diff=True):
+        """
+        Initialisation method. Comparisons are done automatically
+        """
+        self.log = Logger.get_logger()
+        self.first_dict, self.second_dict, self.raise_on_diff = first_dict, second_dict, raise_on_diff
+        self._perform_comparison()
+
+    @logged()
+    def _perform_comparison(self):
+        """
+        Trigger the various comparisons
+        """
+        self.log.debug('First Dictionary: {}'.format(self.first_dict))
+        self.log.debug('Second Dictionary: {}'.format(self.second_dict))
+        self.set_first, self.set_second = set(self.first_dict.keys()), set(self.second_dict.keys())
+        self.intersect = self.set_first.intersection(self.set_second)
+        self.keys_only_in_first_dict = self.keys_only_in_first_dict()
+        self.keys_only_in_second_dict = self.keys_only_in_second_dict()
+        self.differences = self.differences()
+        self.same = self.same()
+        self.result = self.result()
+
+    def keys_only_in_first_dict(self):
+        """
+        Detects keys only present in the first dictionary
+        """
+        return self.set_first - self.intersect
+
+    def keys_only_in_second_dict(self):
+        """
+        Detects keys only present in the second dictionary
+        """
+        return self.set_second - self.intersect
+
+    def differences(self):
+        """
+        Detects matching keys that have a different value
+        """
+        return set(o for o in self.intersect if self.second_dict[o] != self.first_dict[o])
+
+    def same(self):
+        """
+        Detects matching keys that have the same value
+        """
+        return set(o for o in self.intersect if self.second_dict[o] == self.first_dict[o])
+
+    def result(self):
+        """
+        Summarise all the results of the dictionary comparison.
+        Optionally raise an exception if differences were found
+        """
+        self.summary = []
+        if self.keys_only_in_first_dict:
+            self.summary.append(['Keys Only in First Dictionary', self.keys_only_in_first_dict])
+        if self.keys_only_in_second_dict:
+            self.summary.append(['Keys Only in Second Dictionary', self.keys_only_in_second_dict])
+        if self.differences:
+            self.summary.append(['Keys with different values', self.differences])
+        if self.summary:
+            self.log.debug('Dictionary Differences: {}'.format(self.summary))
+            if self.raise_on_diff:
+                raise AutoAssertionError(self.first_dict, self.second_dict,
+                                         msg='Differences found between dictionaries')
+            return False
+        return True
+
+
+class CSVCompare(object):
+    """
+    Calculate the difference between two csv files
+    """
+
+    def __init__(self, first_csv, second_csv, raise_on_diff=True, sort_by=None):
+        self.log = Logger.get_logger()
+        self.raise_on_diff = raise_on_diff
+        self.log.debug('{}'.format(first_csv))
+        self.log.debug('{}'.format(second_csv))
+        with open(first_csv, 'rb') as f1:
+            self.csv1_data = list(csv.reader(f1, delimiter=','))
+        with open(second_csv, 'rb') as f2:
+            self.csv2_data = list(csv.reader(f2, delimiter=','))
+        assertEqual(len(self.csv1_data), len(self.csv2_data), msg='CSV files are not the same size')
+        if sort_by:
+            self.csv1_data = self._sort_by_column(self.csv1_data, sort_column=sort_by)
+            self.csv2_data = self._sort_by_column(self.csv2_data, sort_column=sort_by)
+        self.csv1_data = convert_list_of_list_to_list_of_dictionary(self.csv1_data)
+        self.csv2_data = convert_list_of_list_to_list_of_dictionary(self.csv2_data)
+        self._perform_comparison()
+        self.log.debug('{}'.format(first_csv))
+        self.log.debug('{}'.format(second_csv))
+
+    def _perform_comparison(self):
+        """
+        Compares csv1 data row by row against csv2
+        """
+        self.summary = []
+        csv_row_id = 0
+        for csv1_row, csv2_row in zip(self.csv1_data, self.csv2_data):
+            csv_row_id += 1
+            self.log.debug('Comparing row {} in csv1 to csv2'.format(csv_row_id))
+            row_result = DictCompare(csv1_row, csv2_row, raise_on_diff=False)
+            if not row_result.result:
+                self.summary.append(['Row {}'.format(csv_row_id), row_result.summary])
+        if self.summary:
+            self.log.debug('CSV Row Differences: {}'.format(self.summary))
+            if self.raise_on_diff:
+                raise AutoAssertionError(self.csv1_data, self.csv2_data,
+                                         msg='Differences found between csv data')
+            return False
+        return True
+
+    @logged()
+    def _sort_by_column(self, csv_data, sort_column, reverse=False):
+        """
+        Sorts CSV contents by column name
+        """
+        header = csv_data[0]
+        body = csv_data[1:]
+        col_index = header.index(sort_column)
+        body = sorted(body,
+                      key=operator.itemgetter(col_index),
+                      reverse=reverse)
+        body.insert(0, header)
+        return body
+
+
+def determine_earlier_timestamp(t1, t2):
+    """
+    Given two str timestamps convert to datetimeobject and return earliest
+    """
+    dt1 = datetime.datetime.strptime(t1, '%Y-%m-%dT%H:%M:%S.%f')
+    dt2 = datetime.datetime.strptime(t2, '%Y-%m-%dT%H:%M:%S.%f')
+    if min([dt1, dt2]) == dt1:
+        return t1
+    return t2
+
+
+def determine_newer_timestamp(t1, t2, format='%Y-%m-%dT%H:%M:%S.%f'):
+    """
+    Given two str timestamps convert to datetimeobject and return latest
+    """
+    if isinstance(t1, basestring):
+        t1 = datetime.datetime.strptime(t1, format)
+    if isinstance(t2, basestring):
+        t2 = datetime.datetime.strptime(t2, format)
+    if max([t1, t2]) == t1:
+        return t1
+    return t2
+
+
+def get_timestamp_diff(t1, t2, format=None):
+    """
+    Get the difference between 2 timestamps strings
+    """
+    dt1 = datetime.datetime.strptime(t1, '%Y-%m-%dT%H:%M:%S.%f') if isinstance(t1, basestring) else t1
+    dt2 = datetime.datetime.strptime(t2, '%Y-%m-%dT%H:%M:%S.%f') if isinstance(t2, basestring) else t2
+    diff = max([dt1, dt2]) - min([dt1, dt2])
+    if format:
+        m, s = divmod(diff.seconds, 60)
+        h, m = divmod(m, 60)
+        return "%d:%02d:%02d" % (h, m, s)
+
+    return divmod(diff.total_seconds(), 60)
+
+
+def convert_hms_to_hours(hms):
+    times = hms.split(':')
+    h = float(times[0])
+    m = float(times[1]) / 60
+    s = float(times[2]) / 3600
+    hours = "%.1f" % (h + m + s)
+    return hours
+
+
+def trim_text(text, max_length=None, start_len=None, end_length=None, middle=' ... '):
+    """ Can trim the text to a given length and adds the middle in the middle """
+    if not max_length:
+        return text
+    if max_length > len(text):
+        return text
+    start_len = start_len if start_len else (max_length - len(middle)) / 2
+    end_length = end_length if end_length else max_length - start_len - len(middle)
+    return '{s}{m}{e}'.format(s=text[:start_len], m=middle, e=text[-end_length:])
+
+
+def enforce_timestamp_format(timestamp):
+    format = '%Y-%m-%dT%H:%M:%S.%f'
+    if not timestamp:
+        # default it to now
+        timestamp = datetime.datetime.now().strftime(format=format)
+    if isinstance(timestamp, basestring):
+        for format_ in [format,
+                        '%-m/%-d/%Y %-I:%-M:%-S %p',
+                        '%m/%d/%Y %I:%M:%S %p',
+                        '%Y-%m-%d %H:%M:%S',
+                        '%Y-%m-%d %H:%M:%S.%f',
+                        '%Y-%m-%dT%H:%M:%S',
+                        '%Y-%m-%dT%H:%M:%S.%f']:
+            try:
+                timestamp = datetime.datetime.strptime(timestamp, format_)
+                break
+            except ValueError:
+                pass
+        else:
+            raise Exception('Failed to parse provided timestamp: {}'.format(timestamp))
+    return timestamp.strftime(format=format)[:-3]
+
+
+class SkipTestError(AssertionError):
+    """ User defined assertion exception. """
+
+    def __init__(self, a, b=None, msg=''):
+        bInfo = ' and {0}'.format(b) if (b is not None) else ''
+        super(SkipTestError, self).__init__("Assertion failed: {0}{1} - {2}".format(a, bInfo, msg))
+
+
+def convert_list_of_dicts_to_dict_of_lists(list_of_dicts, key_to_join):
+    """
+        This will convert a list of dicts with similar key values where value of some key is the primary key
+        like [{key: 1, data:2 }, {key:3, data:4}] to
+        {
+            1 : [{key: 1, data:2}]
+            3 : [{key: 3, data:4}]
+        }
+
+        it'll ignore all dicts which don't have the key_to_join or have them as an un-hashable value, it needs to be
+        a simple value which can be the key of a dic
+    :param list_of_dicts: list_of_dicts
+    :param key_to_join: key_to_join who's value is the primary key
+    :return: return dict of lists
+    """
+
+    return_dictionary = dict()
+
+    for dictionary in list_of_dicts:
+        if key_to_join in dictionary:
+            if key_to_join not in return_dictionary:
+                new_key = dictionary[key_to_join]
+                try:
+                    return_dictionary[new_key] = list()
+                except Exception as err:
+                    log.error("There was an error with Key {}, Value {}, err".format(key_to_join,
+                                                                                     dictionary[key_to_join], err))
+                return_dictionary[new_key].append(dictionary)
+
+    return return_dictionary
+
+
+class NestedDict:
+
+    def __init__(self):
+        self.dictionary = dict()
+
+        self.ARRAY_START = "["
+        self.ARRAY_END = "]"
+        self.SEPARATOR = "."
+        self.MAX_INT = 9999999
+
+    def put(self, key, value):
+        array_index = self.get_index_of(key, self.ARRAY_START)
+        nested_index = self.get_index_of(key, self.SEPARATOR)
+
+        if array_index < nested_index:
+            key_to_add = self.get_key(key, self.ARRAY_START)
+
+            if key_to_add not in self.dictionary:
+                self.put(key_to_add, list())
+
+            index = self.get_array_index(key)
+
+            if nested_index < self.MAX_INT:
+
+                if len(self.dictionary.get(key_to_add)) <= index:
+                    nested_dict = NestedDict()
+                    self.dictionary.get(key_to_add).append(nested_dict)
+                else:
+                    nested_dict = self.dictionary.get(key_to_add)[index]
+
+                nested_dict.put(self.get_key_post_index(key, self.SEPARATOR), value)
+            else:
+                self.dictionary.get(key_to_add).append(value)
+
+        elif array_index > nested_index:
+            key_to_add = self.get_key(key, self.SEPARATOR)
+            if key_to_add not in self.dictionary:
+                self.put(key_to_add, NestedDict())
+            self.dictionary.get(key_to_add).put(self.get_key_post_index(key, self.SEPARATOR), value)
+
+        else:
+            key_to_add = key
+            self.dictionary[key_to_add] = value
+
+    @staticmethod
+    def get_array_index(key):
+        try:
+            return int(re.search("\[(\d+)\]", key).group(1))
+        except Exception:
+            return 0
+
+    def get_index_of(self, key, separator):
+        index = str(key).find(separator)
+        return index if index != -1 else self.MAX_INT
+
+    @staticmethod
+    def get_key(key, separator):
+        return str(key)[0: str(key).find(separator)]
+
+    @staticmethod
+    def get_key_post_index(key, separator):
+        return str(key)[str(key).find(separator) + 1:]
+
+    @staticmethod
+    def recursive_change(change_json):
+
+        for key, value in change_json.dictionary.iteritems():
+            if isinstance(value, NestedDict):
+                NestedDict.recursive_change(value)
+                change_json.dictionary[key] = value.dictionary
+
+            if isinstance(value, list):
+                for index, item in enumerate(value):
+                    if isinstance(item, NestedDict):
+                        NestedDict.recursive_change(item)
+                        value[index] = item.dictionary
+
+
+def csv_to_nested_json(csv_path):
+    with open(csv_path, 'rU') as f:
+        data = list(list(rec) for rec in csv.reader(f))
+
+    headers = data[0]
+    rows = data[1:]
+    nested_jsons = list()
+    for row_num, row in enumerate(rows):
+        if not row:
+            continue
+        nested_json = NestedDict()
+        for index, header in enumerate(headers):
+            nested_json.put(header, row[index] if len(row) > index else None)
+        nested_jsons.append((row_num, nested_json))
+
+    return_json = list()
+    for row_num, nested_json in nested_jsons:
+        NestedDict.recursive_change(nested_json)
+        return_json.append((row_num, nested_json.dictionary))
+    return return_json
+
+
+def convert_excel_to_csv(excel_path, base_path=None):
+    wb = open_workbook(excel_path)
+    sheet_paths = list()
+    for i in range(0, wb.nsheets):
+        sheet = wb.sheet_by_index(i)
+        sheet_name = sheet.name.replace(" ", "")
+        if not base_path:
+            base_path = get_temp_directory()
+        sheet_path = "{}/{}.csv".format(base_path, sheet_name)
+        sheet_paths.append(sheet_name)
+        with open(sheet_path, "w") as excel_file:
+            writer = csv.writer(excel_file, delimiter=",")
+            header = [str(cell.value).rstrip('\n').strip('\r') for cell in sheet.row(0)]
+            writer.writerow(header)
+            for row_idx in range(1, sheet.nrows):
+                row = list()
+                for cell in sheet.row(row_idx):
+                    if cell.ctype == XL_CELL_NUMBER:
+                        row.append(float(cell.value))
+                    elif cell.ctype == XL_CELL_BOOLEAN:
+                        row.append(bool(cell.value))
+                    else:
+                        row.append(str(cell.value).rstrip('\n').strip('\r'))
+                writer.writerow(row)
+
+    return sheet_paths
+
+
+def clean_empty(d):
+    """
+        Recursively Clean a nested dictionary
+    :param d: dictionary or list
+    :return:
+    """
+    if not isinstance(d, (dict, list)):
+        return d
+    if isinstance(d, list):
+        return [v for v in (clean_empty(v) for v in d) if v]
+    return {k: v for k, v in ((k, clean_empty(v)) for k, v in d.items()) if v}
+
+
+def get_operation_id():
+    """getting the operation id of event in Admin App"""
+    ran = random.randrange(10 ** 80)
+    myhex = "%064x" % ran
+    # limit string to 32 characters
+    myhex = myhex[:32]
+
+    return myhex
+
+
+if __name__ == "__main__":
+    # csv_to_nested_json(r"C:\Users\nishant.vashisth\Projects\Unification\qa\test_fw\platform_unification\static_data\_data\reportingpreference.csv")
+    pass
